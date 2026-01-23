@@ -16,6 +16,21 @@ MQTT_TOPIC = os.getenv("MQTT_TOPIC", "meters/+/telemetry")
 LEGACY_URL = os.getenv("LEGACY_URL", "http://localhost:8080/ingest")
 HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "5.0"))
 
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
+BACKOFF_BASE_S = float(os.getenv("BACKOFF_BASE_S", "1.0"))
+BACKOFF_MAX_S = float(os.getenv("BACKOFF_MAX_S", "10.0"))
+
+DLQ_PATH = os.getenv("DLQ_PATH", "failed.jsonl")
+
+def write_dlq(data: dict, error: str) -> None:
+    record = {
+        "ts_dlq": int(time.time()),
+        "error": error,
+        "data": data,
+    }
+    with open(DLQ_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
 
 def parse_message(topic: str, payload: bytes) -> Dict[str, Any]:
     """
@@ -58,9 +73,39 @@ def parse_message(topic: str, payload: bytes) -> Dict[str, Any]:
     return out
 
 
-def forward_to_legacy(data: Dict[str, Any]) -> None:
-    r = requests.post(LEGACY_URL, json=data, timeout=HTTP_TIMEOUT_S)
-    r.raise_for_status()
+def forward_to_legacy(data: dict) -> None:
+    last_err = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            r = requests.post(LEGACY_URL, json=data, timeout=HTTP_TIMEOUT_S)
+
+            # Si responde 4xx normalmente es error permanente (payload mal, auth, etc.)
+            # 5xx suele ser transitorio (server caído / problema temporal)
+            if 400 <= r.status_code < 500:
+                r.raise_for_status()
+
+            if r.status_code >= 500:
+                raise requests.HTTPError(f"Legacy 5xx: {r.status_code} body={r.text[:200]}")
+
+            return  # OK
+
+        except Exception as e:
+            last_err = e
+
+            # Backoff exponencial con tope
+            delay = min(BACKOFF_BASE_S * (2 ** (attempt - 1)), BACKOFF_MAX_S)
+            print(
+                f"[BRIDGE] WARN forward failed attempt={attempt}/{MAX_RETRIES} "
+                f"delay={delay:.1f}s err={e}",
+                flush=True,
+            )
+            time.sleep(delay)
+
+    # Si llegamos acá, falló todo: DLQ
+    write_dlq(data, error=str(last_err))
+    raise RuntimeError(f"Forward failed after {MAX_RETRIES} attempts; sent to DLQ: {last_err}")
+
 
 
 def on_connect(client, userdata, flags, reason_code, properties=None):

@@ -25,6 +25,28 @@ BACKOFF_MAX_S = float(os.getenv("BACKOFF_MAX_S", "10.0"))
 DLQ_PATH = os.getenv("DLQ_PATH", "failed.jsonl")
 
 
+class InvalidPayload(Exception):
+    pass
+
+def validate_normalized(data: dict) -> None:
+    if not isinstance(data.get("device_id"), str) or not data["device_id"]:
+        raise InvalidPayload("device_id inválido")
+
+    if not isinstance(data.get("ts"), int):
+        raise InvalidPayload("ts debe ser int (epoch)")
+
+    reading = data.get("reading")
+    if not isinstance(reading, dict):
+        raise InvalidPayload("reading debe ser objeto")
+
+    if not isinstance(reading.get("type"), str):
+        raise InvalidPayload("reading.type inválido")
+
+    value = reading.get("value")
+    if not isinstance(value, (int, float)):
+        raise InvalidPayload("reading.value debe ser numérico")
+
+
 def log(level: str, event: str, **ctx):
     # ISO time (UTC) para que sea consistente en todos lados
     ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
@@ -132,7 +154,7 @@ def forward_to_legacy(data: dict) -> None:
         device_id=data.get("device_id"),
         err=str(last_err),
     )
-    
+
     write_dlq(data, error=str(last_err))
     raise RuntimeError(f"Forward failed after {MAX_RETRIES} attempts; sent to DLQ: {last_err}")
 
@@ -147,18 +169,33 @@ def on_connect(client, userdata, flags, reason_code, properties=None):
 def on_message(client, userdata, msg):
     try:
         normalized = parse_message(msg.topic, msg.payload)
+
+        # ⬅ VALIDACIÓN
+        validate_normalized(normalized)
+
         forward_to_legacy(normalized)
 
         log_info(
             "forward_ok",
-            device_id=normalized.get("device_id"),
+            device_id=normalized["device_id"],
             topic=msg.topic,
-            ts=normalized.get("ts"),
-            value=normalized.get("reading", {}).get("value"),
-            type=normalized.get("reading", {}).get("type"),
+            value=normalized["reading"]["value"],
         )
+
+    except InvalidPayload as e:
+        log_error(
+            "invalid_payload_dlq",
+            topic=msg.topic,
+            err=str(e),
+        )
+        write_dlq(
+            normalized if "normalized" in locals() else {"raw": msg.payload.decode()},
+            error=str(e),
+        )
+
     except Exception as e:
         log_error("forward_failed", topic=msg.topic, err=str(e))
+
 
 
 

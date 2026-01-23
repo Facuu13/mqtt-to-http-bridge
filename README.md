@@ -48,29 +48,118 @@ Lo que se evita en este proyecto no es el broker (que puede ser liviano), sino m
 
 ---
 
-## Roadmap (incremental)
 
-### Etapa 1 — Setup reproducible (Docker + scripts)
-- [ ] Broker Mosquitto en Docker
-- [ ] Legacy receiver (Flask)
-- [ ] Bridge subscriber (paho-mqtt + requests)
-- [ ] Device simulator (publisher)
+## ▶️ Quickstart — Run with one command
 
-### Etapa 2 — Robustez “de producción”
-- [ ] Retries con backoff en forward HTTP
-- [ ] Dead-letter queue (DLQ) a archivo `failed.jsonl`
-- [ ] Logs estructurados (niveles, contexto)
-- [ ] Validación estricta de esquema (opcional)
+Este proyecto puede ejecutarse **completamente con Docker Compose**, sin necesidad de instalar Python, MQTT ni dependencias adicionales en el host (excepto Docker).
 
-### Etapa 3 — Calidad y testing
-- [ ] Tests unitarios de parsing (pytest)
-- [ ] Tests de integración (publicar MQTT y validar recepción legacy)
-- [ ] Lint/format (ruff/black)
+### Requisitos
 
-### Etapa 4 — Variantes de salida legacy
-- [ ] Forward por HTTP a script PHP real
-- [ ] Escritura a archivo CSV/JSONL para consumo batch
-- [ ] Ejecución de script externo (subprocess) para integraciones puntuales
+* Docker
+* Docker Compose (plugin `docker compose`)
 
 ---
+
+### 1️⃣ Levantar todos los servicios
+
+Desde la raíz del repositorio:
+
+```bash
+cd docker
+docker compose up --build
+```
+
+Esto levanta automáticamente:
+
+* **Mosquitto** (broker MQTT) en `localhost:1883`
+* **Legacy receiver** (simula un sistema legacy PHP/LAMP) en `localhost:8080`
+* **Bridge** (MQTT → HTTP forwarder con retries, DLQ y logs)
+
+---
+
+### 2️⃣ Publicar un mensaje de prueba (sin Python)
+
+En otra terminal, ejecutá:
+
+```bash
+docker run --rm --network host eclipse-mosquitto:2 \
+  mosquitto_pub \
+  -h localhost -p 1883 \
+  -t "meters/meter-001/telemetry" \
+  -m '{"device_id":"meter-001","type":"water","value":12.3,"unit":"L/min","ts":1700000000}'
+```
+
+---
+
+### 3️⃣ Verificar el flujo end-to-end
+
+Si todo está funcionando correctamente, deberías ver:
+
+#### En los logs del **bridge**:
+
+```
+[INFO] mqtt_connected ...
+[INFO] forward_ok device_id='meter-001' ...
+```
+
+#### En los logs del **legacy**:
+
+```
+[LEGACY] received: {'device_id': 'meter-001', ...}
+```
+
+Esto confirma que:
+
+```
+MQTT → Bridge → Legacy
+```
+
+funciona correctamente.
+
+---
+
+### 4️⃣ Probar tolerancia a fallos (DLQ)
+
+1. Detené el legacy:
+
+```bash
+docker stop legacy
+```
+
+2. Volvé a publicar un mensaje MQTT.
+
+3. El bridge va a:
+
+* reintentar con backoff
+* registrar errores
+* guardar el mensaje en el DLQ
+
+El archivo DLQ queda en:
+
+```
+docker/data/failed.jsonl
+```
+
+Cada línea corresponde a un mensaje que no pudo ser entregado.
+
+---
+
+### 5️⃣ Volver a levantar el legacy
+
+```bash
+docker start legacy
+```
+
+---
+
+## 🧹 Apagar todo
+
+Para detener los servicios:
+
+```bash
+docker compose down
+```
+
+---
+
 

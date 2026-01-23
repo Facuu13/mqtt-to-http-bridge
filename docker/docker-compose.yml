@@ -16,3 +16,28 @@ services:
     command: bash -lc "pip install -r requirements.txt && python legacy_receiver.py"
     ports:
       - "8080:8080"
+
+  bridge:
+    build:
+      context: ../bridge
+      dockerfile: Dockerfile
+    container_name: bridge
+    depends_on:
+      - mosquitto
+      - legacy
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: "1883"
+      MQTT_TOPIC: "meters/+/telemetry"
+
+      LEGACY_URL: "http://legacy:8080/ingest"
+      HTTP_TIMEOUT_S: "5"
+
+      MAX_RETRIES: "5"
+      BACKOFF_BASE_S: "1"
+      BACKOFF_MAX_S: "10"
+
+      DLQ_PATH: "/data/failed.jsonl"
+    volumes:
+      # Persistimos el DLQ en tu repo (carpeta docker/data)
+      - ./data:/data

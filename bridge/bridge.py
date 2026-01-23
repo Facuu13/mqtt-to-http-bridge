@@ -6,6 +6,8 @@ from typing import Any, Dict, Optional
 import requests
 import paho.mqtt.client as mqtt
 
+from datetime import datetime
+
 
 # MQTT
 MQTT_HOST = os.getenv("MQTT_HOST", "localhost")
@@ -21,6 +23,24 @@ BACKOFF_BASE_S = float(os.getenv("BACKOFF_BASE_S", "1.0"))
 BACKOFF_MAX_S = float(os.getenv("BACKOFF_MAX_S", "10.0"))
 
 DLQ_PATH = os.getenv("DLQ_PATH", "failed.jsonl")
+
+
+def log(level: str, event: str, **ctx):
+    # ISO time (UTC) para que sea consistente en todos lados
+    ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+    # Formato "key=value" (simple, legible, parseable)
+    ctx_str = " ".join(f"{k}={repr(v)}" for k, v in ctx.items())
+
+    if ctx_str:
+        print(f"{ts} [{level}] {event} {ctx_str}", flush=True)
+    else:
+        print(f"{ts} [{level}] {event}", flush=True)
+
+def log_info(event: str, **ctx): log("INFO", event, **ctx)
+def log_warn(event: str, **ctx): log("WARN", event, **ctx)
+def log_error(event: str, **ctx): log("ERROR", event, **ctx)
+
 
 def write_dlq(data: dict, error: str) -> None:
     record = {
@@ -95,31 +115,51 @@ def forward_to_legacy(data: dict) -> None:
 
             # Backoff exponencial con tope
             delay = min(BACKOFF_BASE_S * (2 ** (attempt - 1)), BACKOFF_MAX_S)
-            print(
-                f"[BRIDGE] WARN forward failed attempt={attempt}/{MAX_RETRIES} "
-                f"delay={delay:.1f}s err={e}",
-                flush=True,
-            )
+            log_warn(
+                "legacy_forward_retry",
+                attempt=attempt,
+                max_retries=MAX_RETRIES,
+                delay_s=round(delay, 2),
+                err=str(e),
+                device_id=data.get("device_id"),
+                )
+
             time.sleep(delay)
 
-    # Si llegamos acá, falló todo: DLQ
+    log_error(
+        "sent_to_dlq",
+        dlq_path=DLQ_PATH,
+        device_id=data.get("device_id"),
+        err=str(last_err),
+    )
+    
     write_dlq(data, error=str(last_err))
     raise RuntimeError(f"Forward failed after {MAX_RETRIES} attempts; sent to DLQ: {last_err}")
 
 
 
 def on_connect(client, userdata, flags, reason_code, properties=None):
-    print(f"[BRIDGE] Connected rc={reason_code}. Subscribing to {MQTT_TOPIC}", flush=True)
+    log_info("mqtt_connected", rc=reason_code, topic=MQTT_TOPIC, host=MQTT_HOST, port=MQTT_PORT)
     client.subscribe(MQTT_TOPIC, qos=1)
+
 
 
 def on_message(client, userdata, msg):
     try:
         normalized = parse_message(msg.topic, msg.payload)
         forward_to_legacy(normalized)
-        print(f"[BRIDGE] OK device={normalized['device_id']} topic={msg.topic}", flush=True)
+
+        log_info(
+            "forward_ok",
+            device_id=normalized.get("device_id"),
+            topic=msg.topic,
+            ts=normalized.get("ts"),
+            value=normalized.get("reading", {}).get("value"),
+            type=normalized.get("reading", {}).get("type"),
+        )
     except Exception as e:
-        print(f"[BRIDGE] ERROR topic={msg.topic} err={e}", flush=True)
+        log_error("forward_failed", topic=msg.topic, err=str(e))
+
 
 
 def main():
@@ -127,7 +167,7 @@ def main():
     client.on_connect = on_connect
     client.on_message = on_message
 
-    print(f"[BRIDGE] Connecting to mqtt://{MQTT_HOST}:{MQTT_PORT} ...", flush=True)
+    log_info("bridge_start", mqtt_host=MQTT_HOST, mqtt_port=MQTT_PORT, topic=MQTT_TOPIC, legacy_url=LEGACY_URL)
     client.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
     client.loop_forever()
 
